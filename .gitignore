@@ -18,6 +18,9 @@
 # Debug files
 *.log
 
+# Release artifacts
+/release/
+
 # Static binary in root (optional - remove if you want to commit it)
 /sheepnet
 

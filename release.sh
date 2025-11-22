@@ -1,25 +1,38 @@
 #!/bin/bash
-# Release script for Sheepnet
-# Usage: ./release.sh [patch|minor|major]
-
 set -e
 
-GRADLE_FILE="app/build.gradle.kts"
+# Sheepnet Release Script
+# Bumps version, creates git tag, and triggers automated release build
 
-# Get current version
-CURRENT_VERSION=$(grep "versionName = " "$GRADLE_FILE" | sed 's/.*"\(.*\)".*/\1/')
-CURRENT_CODE=$(grep "versionCode = " "$GRADLE_FILE" | sed 's/.*= \([0-9]*\).*/\1/')
+BUMP_TYPE="$1"
 
-echo "Current version: $CURRENT_VERSION (code: $CURRENT_CODE)"
+if [ -z "$BUMP_TYPE" ]; then
+    echo "Usage: $0 <patch|minor|major>"
+    echo ""
+    echo "  patch  - 0.1.0 -> 0.1.1 (bug fixes)"
+    echo "  minor  - 0.1.0 -> 0.2.0 (new features)"
+    echo "  major  - 0.1.0 -> 1.0.0 (breaking changes)"
+    exit 1
+fi
+
+if [[ ! "$BUMP_TYPE" =~ ^(patch|minor|major)$ ]]; then
+    echo "Error: Bump type must be 'patch', 'minor', or 'major'"
+    exit 1
+fi
+
+# Get current version from Cargo.toml
+CURRENT_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+
+if [ -z "$CURRENT_VERSION" ]; then
+    echo "Error: Could not find version in Cargo.toml"
+    exit 1
+fi
 
 # Parse version
-IFS='.' read -r -a VERSION_PARTS <<< "$CURRENT_VERSION"
-MAJOR="${VERSION_PARTS[0]}"
-MINOR="${VERSION_PARTS[1]}"
-PATCH="${VERSION_PARTS[2]}"
+IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
 
-# Determine new version based on argument
-case "$1" in
+# Bump version based on type
+case "$BUMP_TYPE" in
     patch)
         PATCH=$((PATCH + 1))
         ;;
@@ -32,48 +45,68 @@ case "$1" in
         MINOR=0
         PATCH=0
         ;;
-    *)
-        echo "Usage: $0 [patch|minor|major]"
-        echo ""
-        echo "Current version: $CURRENT_VERSION"
-        echo "  patch: $MAJOR.$MINOR.$((PATCH + 1))"
-        echo "  minor: $MAJOR.$((MINOR + 1)).0"
-        echo "  major: $((MAJOR + 1)).0.0"
-        exit 1
-        ;;
 esac
 
-NEW_VERSION="$MAJOR.$MINOR.$PATCH"
-NEW_CODE=$((CURRENT_CODE + 1))
+NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
 
-echo "New version: $NEW_VERSION (code: $NEW_CODE)"
+echo "Preparing release"
+echo "===================================="
+echo "Current version: ${CURRENT_VERSION}"
+echo "New version:     ${NEW_VERSION}"
+echo "Bump type:       ${BUMP_TYPE}"
 echo ""
 
-# Confirm
-read -p "Create release $NEW_VERSION? (y/N) " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
+# Check for uncommitted changes
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Error: You have uncommitted changes. Please commit or stash them first."
+    git status --short
     exit 1
 fi
 
-# Update build.gradle.kts
-sed -i "s/versionCode = $CURRENT_CODE/versionCode = $NEW_CODE/" "$GRADLE_FILE"
-sed -i "s/versionName = \"$CURRENT_VERSION\"/versionName = \"$NEW_VERSION\"/" "$GRADLE_FILE"
+# Check if tag already exists
+if git rev-parse "v${NEW_VERSION}" >/dev/null 2>&1; then
+    echo "Error: Tag v${NEW_VERSION} already exists"
+    exit 1
+fi
 
-echo "✓ Updated $GRADLE_FILE"
+# Update version in Cargo.toml
+echo "Updating version in Cargo.toml..."
+sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
 
-# Git commit and tag
-git add "$GRADLE_FILE"
-git commit -m "Release v$NEW_VERSION"
-git tag "v$NEW_VERSION"
+# Update Cargo.lock
+echo "Updating Cargo.lock..."
+cargo check --quiet
 
-echo "✓ Created commit and tag v$NEW_VERSION"
+# Show changes
+echo ""
+echo "Changes:"
+git diff Cargo.toml Cargo.lock
+
+# Commit changes
+echo ""
+read -p "Commit and tag version ${NEW_VERSION}? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Aborted. Restoring files..."
+    git checkout Cargo.toml Cargo.lock
+    exit 0
+fi
+
+git add Cargo.toml Cargo.lock
+git commit -m "Release v${NEW_VERSION}"
+
+# Create and push tag
+echo "Creating tag v${NEW_VERSION}..."
+git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
+
+echo ""
+echo "Done!"
 echo ""
 echo "Next steps:"
-echo "  git push origin main"
-echo "  git push origin v$NEW_VERSION"
+echo "  1. Review the commit: git show"
+echo "  2. Push to GitHub: git push && git push origin v${NEW_VERSION}"
 echo ""
-echo "Or in one command:"
-echo "  git push origin main && git push origin v$NEW_VERSION"
-
+echo "The GitHub Action will automatically:"
+echo "  - Build the static binary"
+echo "  - Create the release"
+echo "  - Upload the binary as release asset"
