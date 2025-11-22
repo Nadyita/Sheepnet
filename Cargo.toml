@@ -1,0 +1,34 @@
+[package]
+name = "sheepnet"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Your Name <your.email@example.com>"]
+description = "Discord bot that posts daily Guild Wars activities"
+repository = "https://github.com/yourusername/sheepnet"
+
+[dependencies]
+# Discord library
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# HTTP client
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+# HTML parsing
+scraper = "0.20"
+# Date/time handling
+chrono = "0.4"
+# Regex
+regex = "1"
+# Error handling
+anyhow = "1"
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"  # Optimize for size
