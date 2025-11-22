@@ -49,12 +49,7 @@ esac
 
 NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
 
-echo "Preparing release"
-echo "===================================="
-echo "Current version: ${CURRENT_VERSION}"
-echo "New version:     ${NEW_VERSION}"
-echo "Bump type:       ${BUMP_TYPE}"
-echo ""
+echo "Bumping version: ${CURRENT_VERSION} -> ${NEW_VERSION} (${BUMP_TYPE})"
 
 # Check for uncommitted changes
 if [ -n "$(git status --porcelain)" ]; then
@@ -70,43 +65,18 @@ if git rev-parse "v${NEW_VERSION}" >/dev/null 2>&1; then
 fi
 
 # Update version in Cargo.toml
-echo "Updating version in Cargo.toml..."
 sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
 
 # Update Cargo.lock
-echo "Updating Cargo.lock..."
-cargo check --quiet
-
-# Show changes
-echo ""
-echo "Changes:"
-git diff Cargo.toml Cargo.lock
+cargo check --quiet 2>/dev/null
 
 # Commit changes
-echo ""
-read -p "Commit and tag version ${NEW_VERSION}? (y/N) " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted. Restoring files..."
-    git checkout Cargo.toml Cargo.lock
-    exit 0
-fi
-
 git add Cargo.toml Cargo.lock
-git commit -m "Release v${NEW_VERSION}"
+git commit -m "Release v${NEW_VERSION}" --quiet
 
-# Create and push tag
-echo "Creating tag v${NEW_VERSION}..."
+# Create tag
 git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
 
+echo "Created tag v${NEW_VERSION}"
 echo ""
-echo "Done!"
-echo ""
-echo "Next steps:"
-echo "  1. Review the commit: git show"
-echo "  2. Push to GitHub: git push && git push origin v${NEW_VERSION}"
-echo ""
-echo "The GitHub Action will automatically:"
-echo "  - Build the static binary"
-echo "  - Create the release"
-echo "  - Upload the binary as release asset"
+echo "Push with: git push && git push origin v${NEW_VERSION}"
