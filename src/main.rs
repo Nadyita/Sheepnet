@@ -7,6 +7,7 @@ use serenity::all::{ChannelId, CreateEmbed, CreateMessage, Context, Ready};
 use serenity::async_trait;
 use serenity::prelude::*;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration as TokioDuration};
 
@@ -56,6 +57,8 @@ struct Handler {
     channel_id: ChannelId,
     http_client: reqwest::Client,
     run_once: bool,
+    started: Arc<AtomicBool>,
+    post_now: bool,
 }
 
 #[async_trait]
@@ -63,19 +66,27 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
 
+        // Prevent spawning multiple timers on reconnect
+        if self.started.swap(true, Ordering::SeqCst) {
+            println!("Reconnected, but timer already running");
+            return;
+        }
+
         let ctx = Arc::new(ctx);
         let channel_id = self.channel_id;
         let http_client = self.http_client.clone();
         let run_once = self.run_once;
+        let post_now = self.post_now;
 
         tokio::spawn(async move {
             loop {
-                let now = Utc::now();
-                let target_time = get_target_time(&now);
-                let delay = (target_time - now).num_seconds().max(0) as u64;
-                println!("Sleeping {} seconds until next post", delay);
-
-                sleep(TokioDuration::from_secs(delay)).await;
+                if !post_now {
+                    let now = Utc::now();
+                    let target_time = get_target_time(&now);
+                    let delay = (target_time - now).num_seconds().max(0) as u64;
+                    println!("Sleeping {} seconds until next post", delay);
+                    sleep(TokioDuration::from_secs(delay)).await;
+                }
 
                 if let Err(e) = daily_post(&ctx, channel_id, &http_client).await {
                     eprintln!("Error in daily post: {}", e);
@@ -84,6 +95,15 @@ impl EventHandler for Handler {
                 if run_once {
                     println!("Single run completed, exiting...");
                     std::process::exit(0);
+                }
+
+                // After first (immediate) post, wait for next scheduled time
+                if post_now {
+                    let now = Utc::now();
+                    let target_time = get_target_time(&now);
+                    let delay = (target_time - now).num_seconds().max(0) as u64;
+                    println!("Sleeping {} seconds until next post", delay);
+                    sleep(TokioDuration::from_secs(delay)).await;
                 }
             }
         });
@@ -341,8 +361,8 @@ pub fn get_weekly_data(body: &str, now: &DateTime<Utc>) -> Result<WeeklyData> {
         }
 
         return Ok(WeeklyData {
-            pve: convert_link(&get_html(&cells[1]))?,
-            pvp: convert_link(&get_html(&cells[2]))?,
+            pve: strip_link(&get_html(&cells[1]))?,
+            pvp: strip_link(&get_html(&cells[2]))?,
             ni: convert_link(&get_html(&cells[3]))?,
         });
     }
@@ -351,7 +371,8 @@ pub fn get_weekly_data(body: &str, now: &DateTime<Utc>) -> Result<WeeklyData> {
 }
 
 pub fn convert_link(html: &str) -> Result<String> {
-    let link_re = Regex::new(r#"<a href="(.+?)".*?>(.+?)</a>"#).unwrap();
+    // Match <a> tags with href attribute (in any position)
+    let link_re = Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>(.+?)</a>"#).unwrap();
     if let Some(caps) = link_re.captures(html) {
         let url = &caps[1];
         let text = &caps[2];
@@ -370,6 +391,32 @@ pub fn convert_link(html: &str) -> Result<String> {
         }
     }
 
+    let html_tag_re = Regex::new(r"<[^>]+>").unwrap();
+    let stripped = html_tag_re.replace_all(html, "").to_string();
+
+    Ok(stripped)
+}
+
+pub fn strip_link(html: &str) -> Result<String> {
+    // Extract text from <a> tag without creating a link
+    let link_re = Regex::new(r#"<a\s+[^>]*>(.+?)</a>"#).unwrap();
+    if let Some(caps) = link_re.captures(html) {
+        let text = caps[1].to_string();
+        
+        // Extract any text after the link (e.g., " (3x)")
+        let after_link = html[caps.get(0).unwrap().end()..].trim();
+        
+        if after_link.is_empty() {
+            return Ok(text);
+        } else {
+            // Remove remaining HTML tags from the suffix
+            let html_tag_re = Regex::new(r"<[^>]+>").unwrap();
+            let clean_suffix = html_tag_re.replace_all(after_link, "");
+            return Ok(format!("{} {}", text, clean_suffix));
+        }
+    }
+
+    // Fallback: strip all HTML tags
     let html_tag_re = Regex::new(r"<[^>]+>").unwrap();
     let stripped = html_tag_re.replace_all(html, "").to_string();
 
@@ -613,13 +660,15 @@ async fn main() -> Result<()> {
         channel_id_str.parse().with_context(|| "CHANNEL_ID must be a valid number")?
     };
 
-    let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+    let intents = GatewayIntents::empty();
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler {
             channel_id: ChannelId::new(channel_id),
             http_client,
             run_once: !args.r#loop,
+            started: Arc::new(AtomicBool::new(false)),
+            post_now: args.now,
         })
         .await
         .with_context(|| "Failed to create Discord client")?;
@@ -656,6 +705,12 @@ mod tests {
         assert!(!data.sb.is_empty(), "Wanted should not be empty");
         assert!(!data.vq.is_empty(), "Vanguard Quest should not be empty");
         assert!(!data.ns.is_empty(), "Nicholas Sandford should not be empty");
+        
+        // Check that links are present
+        assert!(data.zm.contains("]("), "Zaishen Mission should have a link: {}", data.zm);
+        assert!(data.zb.contains("]("), "Zaishen Bounty should have a link: {}", data.zb);
+        assert!(data.zc.contains("]("), "Zaishen Combat should have a link: {}", data.zc);
+        assert!(data.zv.contains("]("), "Zaishen Vanquish should have a link: {}", data.zv);
     }
 
     #[test]
