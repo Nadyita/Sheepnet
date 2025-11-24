@@ -19,6 +19,7 @@ const INITIAL_BACKOFF_SECONDS: u64 = 1;
 #[derive(Parser, Debug)]
 #[command(name = "sheepnet")]
 #[command(about = "Guild Wars daily activities Discord bot", long_about = None)]
+#[command(version)]
 struct Args {
     /// Run in loop mode (keep running daily) or run once
     #[arg(long, default_value_t = false)]
@@ -64,7 +65,7 @@ struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+        println!("{} {} is connected!", ready.user.name, env!("CARGO_PKG_VERSION"));
 
         // Prevent spawning multiple timers on reconnect
         if self.started.swap(true, Ordering::SeqCst) {
