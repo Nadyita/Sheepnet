@@ -5,7 +5,7 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["Your Name <your.email@example.com>"]
 description = "Discord bot that posts daily Guild Wars activities"
-repository = "https://github.com/yourusername/sheepnet"
+repository = "https://github.com/mreidel/sheepnet"
 
 [dependencies]
 # Discord library
@@ -13,7 +13,7 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 # HTTP client
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
 # HTML parsing
 scraper = "0.20"
 # Date/time handling
@@ -26,6 +26,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 strip = true

@@ -84,6 +84,8 @@ Options:
   --output-format <FORMAT>    Output format [default: discord]
                               [possible values: discord, txt, md, html]
   --at-time <TIME>            Simulate a specific time (YYYY-MM-DDTHH:MM:SS)
+  --auto-update               Enable automatic updates from GitHub releases
+  --version                   Print version information
   -h, --help                  Print help
 ```
 
@@ -124,6 +126,70 @@ export TOKEN="your-token"
 export CHANNEL_ID="your-channel-id"
 cargo run --release -- --loop
 ```
+
+**Enable automatic updates:**
+
+```bash
+export TOKEN="your-token"
+export CHANNEL_ID="your-channel-id"
+cargo run --release -- --loop --auto-update
+```
+
+## Auto-Update Feature
+
+The bot can automatically update itself from GitHub releases when run with the `--auto-update` flag.
+
+### How It Works
+
+1. **Daily Check**: At 15:00 UTC (one hour before posting), the bot checks GitHub for new releases
+2. **Version Comparison**: Compares current version with the latest release tag
+3. **Download & Verify**: Downloads the new binary and SHA256 checksum
+4. **Security**: Verifies the checksum before replacing the binary
+5. **Atomic Update**: Replaces the running binary atomically (no downtime)
+6. **Restart**: Exits with code 42 to signal systemd/supervisor to restart
+
+### Requirements
+
+- Bot must have write permissions to its own binary file
+- `sha256sum` command must be available
+- Configured restart policy (e.g., systemd `Restart=always`)
+
+### SystemD Configuration Example
+
+```ini
+[Unit]
+Description=Sheepnet Guild Wars Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=sheepnet
+WorkingDirectory=/opt/sheepnet
+Environment="TOKEN=your-token-here"
+Environment="CHANNEL_ID=your-channel-id-here"
+ExecStart=/usr/local/bin/sheepnet-linux-x86_64 --loop --auto-update
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### SELinux Considerations
+
+On systems with SELinux (like Fedora), the bot automatically attempts to copy the security context from the old binary to the new one using `chcon --reference`. If you encounter permission issues after an update, run:
+
+```bash
+restorecon -v /path/to/sheepnet-linux-x86_64
+```
+
+### Security Notes
+
+- Only downloads releases from the repository specified in `Cargo.toml`
+- Always verifies SHA256 checksums before installation
+- Creates a `.backup` file of the old binary
+- If update fails, the bot continues running with the current version
+- Exit code 42 signals successful update and restart
 
 ## Testing
 

@@ -3,10 +3,13 @@ use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
 use regex::Regex;
 use scraper::{Html, Selector};
+use serde::Deserialize;
 use serenity::all::{ChannelId, CreateEmbed, CreateMessage, Context, Ready};
 use serenity::async_trait;
 use serenity::prelude::*;
 use std::env;
+use std::fs;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration as TokioDuration};
@@ -15,6 +18,18 @@ const DAILY_URL: &str = "https://wiki.guildwars.com/wiki/Daily_activities";
 const WEEKLY_URL: &str = "https://wiki.guildwars.com/wiki/Weekly_activities";
 const MAX_BACKOFF_SECONDS: u64 = 300; // 5 minutes
 const INITIAL_BACKOFF_SECONDS: u64 = 1;
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "sheepnet")]
@@ -40,6 +55,10 @@ struct Args {
     /// Simulate a specific time (format: YYYY-MM-DDTHH:MM:SS, e.g., 2025-11-25T17:00:00)
     #[arg(long)]
     at_time: Option<String>,
+
+    /// Enable automatic updates from GitHub releases (checks daily at 15:00 UTC)
+    #[arg(long, default_value_t = false)]
+    auto_update: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -60,6 +79,7 @@ struct Handler {
     run_once: bool,
     started: Arc<AtomicBool>,
     post_now: bool,
+    auto_update: bool,
 }
 
 #[async_trait]
@@ -78,33 +98,63 @@ impl EventHandler for Handler {
         let http_client = self.http_client.clone();
         let run_once = self.run_once;
         let post_now = self.post_now;
+        let auto_update = self.auto_update;
 
         tokio::spawn(async move {
             loop {
+                let now = Utc::now();
+                
+                // Calculate next update time (15:00 UTC) and next post time (16:00:05 UTC)
+                let update_time = if auto_update {
+                    Some(get_update_time(&now))
+                } else {
+                    None
+                };
+                let post_time = get_target_time(&now);
+                
+                // Determine which event comes first
+                let (next_event_time, is_update) = if let Some(ut) = update_time {
+                    if ut < post_time {
+                        (ut, true)
+                    } else {
+                        (post_time, false)
+                    }
+                } else {
+                    (post_time, false)
+                };
+                
+                // Sleep until next event, unless --now is set for first run
                 if !post_now {
-                    let now = Utc::now();
-                    let target_time = get_target_time(&now);
-                    let delay = (target_time - now).num_seconds().max(0) as u64;
-                    println!("Sleeping {} seconds until next post", delay);
+                    let delay = (next_event_time - now).num_seconds().max(0) as u64;
+                    println!("Sleeping {} seconds until next {}", delay, if is_update { "update check" } else { "post" });
                     sleep(TokioDuration::from_secs(delay)).await;
                 }
-
-                if let Err(e) = daily_post(&ctx, channel_id, &http_client).await {
-                    eprintln!("Error in daily post: {}", e);
-                }
-
-                if run_once {
-                    println!("Single run completed, exiting...");
-                    std::process::exit(0);
+                
+                println!("Tick");
+                
+                // Perform the appropriate action
+                if is_update {
+                    // Check for updates at 15:00 UTC
+                    if let Err(e) = auto_update_check(&http_client).await {
+                        eprintln!("Error during auto-update check: {}", e);
+                    }
+                } else {
+                    // Post daily activities at 16:00:05 UTC
+                    if let Err(e) = daily_post(&ctx, channel_id, &http_client).await {
+                        eprintln!("Error in daily post: {}", e);
+                    }
+                    
+                    if run_once {
+                        println!("Single run completed, exiting...");
+                        std::process::exit(0);
+                    }
                 }
 
                 // After first (immediate) post, wait for next scheduled time
                 if post_now {
-                    let now = Utc::now();
-                    let target_time = get_target_time(&now);
-                    let delay = (target_time - now).num_seconds().max(0) as u64;
-                    println!("Sleeping {} seconds until next post", delay);
-                    sleep(TokioDuration::from_secs(delay)).await;
+                    // For subsequent iterations, we need to wait
+                    // This is only executed once after the immediate post
+                    continue;
                 }
             }
         });
@@ -114,6 +164,18 @@ impl EventHandler for Handler {
 fn get_target_time(now: &DateTime<Utc>) -> DateTime<Utc> {
     let mut target = Utc
         .with_ymd_and_hms(now.year(), now.month(), now.day(), 16, 0, 5)
+        .unwrap();
+
+    if *now >= target {
+        target = target + Duration::days(1);
+    }
+
+    target
+}
+
+fn get_update_time(now: &DateTime<Utc>) -> DateTime<Utc> {
+    let mut target = Utc
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 15, 0, 0)
         .unwrap();
 
     if *now >= target {
@@ -670,6 +732,7 @@ async fn main() -> Result<()> {
             run_once: !args.r#loop,
             started: Arc::new(AtomicBool::new(false)),
             post_now: args.now,
+            auto_update: args.auto_update,
         })
         .await
         .with_context(|| "Failed to create Discord client")?;
@@ -680,6 +743,231 @@ async fn main() -> Result<()> {
         client.start().await.with_context(|| "Client error")?;
     }
 
+    Ok(())
+}
+
+/// Extract repository owner and name from Cargo.toml repository URL
+fn get_repo_info() -> Result<(String, String)> {
+    let repo_url = env!("CARGO_PKG_REPOSITORY");
+    
+    // Parse URL like https://github.com/owner/repo
+    let parts: Vec<&str> = repo_url
+        .trim_end_matches('/')
+        .split('/')
+        .collect();
+    
+    if parts.len() < 2 {
+        anyhow::bail!("Invalid repository URL format: {}", repo_url);
+    }
+    
+    let owner = parts[parts.len() - 2].to_string();
+    let repo = parts[parts.len() - 1].to_string();
+    
+    Ok((owner, repo))
+}
+
+/// Check for updates on GitHub and return the latest release info if a new version is available
+async fn check_for_updates(http_client: &reqwest::Client) -> Result<Option<GithubRelease>> {
+    let (owner, repo) = get_repo_info()?;
+    let url = format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo);
+    
+    println!("Checking for updates at {}", url);
+    
+    let response = http_client
+        .get(&url)
+        .header("User-Agent", "sheepnet")
+        .send()
+        .await
+        .context("Failed to fetch GitHub releases")?;
+    
+    if !response.status().is_success() {
+        anyhow::bail!("GitHub API returned status: {}", response.status());
+    }
+    
+    let release: GithubRelease = response
+        .json()
+        .await
+        .context("Failed to parse GitHub release JSON")?;
+    
+    // Remove 'v' prefix if present for comparison
+    let latest_version = release.tag_name.trim_start_matches('v');
+    let current_version = env!("CARGO_PKG_VERSION");
+    
+    println!("Current version: {}, Latest version: {}", current_version, latest_version);
+    
+    if latest_version != current_version {
+        println!("New version available: {}", latest_version);
+        Ok(Some(release))
+    } else {
+        println!("Already running the latest version");
+        Ok(None)
+    }
+}
+
+/// Download a file from URL and return its contents
+async fn download_file(http_client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    println!("Downloading {}", url);
+    
+    let response = http_client
+        .get(url)
+        .send()
+        .await
+        .context("Failed to download file")?;
+    
+    if !response.status().is_success() {
+        anyhow::bail!("Download failed with status: {}", response.status());
+    }
+    
+    let bytes = response
+        .bytes()
+        .await
+        .context("Failed to read response body")?;
+    
+    Ok(bytes.to_vec())
+}
+
+/// Verify SHA256 checksum
+fn verify_checksum(data: &[u8], expected_checksum: &str) -> Result<()> {
+    use std::process::Command;
+    
+    // Write data to temp file for checksum verification
+    let temp_path = env::temp_dir().join("sheepnet_download");
+    fs::write(&temp_path, data)
+        .context("Failed to write temporary file")?;
+    
+    // Calculate checksum using sha256sum
+    let output = Command::new("sha256sum")
+        .arg(&temp_path)
+        .output()
+        .context("Failed to run sha256sum")?;
+    
+    let checksum_output = String::from_utf8_lossy(&output.stdout);
+    let calculated_checksum = checksum_output
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Invalid sha256sum output"))?;
+    
+    fs::remove_file(&temp_path).ok();
+    
+    if calculated_checksum != expected_checksum.trim() {
+        anyhow::bail!(
+            "Checksum mismatch! Expected: {}, Got: {}",
+            expected_checksum.trim(),
+            calculated_checksum
+        );
+    }
+    
+    println!("Checksum verified successfully");
+    Ok(())
+}
+
+/// Perform self-update: download new binary, verify it, and replace current binary
+async fn perform_self_update(http_client: &reqwest::Client, release: GithubRelease) -> Result<()> {
+    // Find the binary and checksum assets
+    let binary_name = "sheepnet-linux-x86_64";
+    let checksum_name = "sheepnet-linux-x86_64.sha256";
+    
+    let binary_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == binary_name)
+        .ok_or_else(|| anyhow::anyhow!("Binary asset not found in release"))?;
+    
+    let checksum_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == checksum_name)
+        .ok_or_else(|| anyhow::anyhow!("Checksum asset not found in release"))?;
+    
+    // Download checksum first
+    let checksum_data = download_file(http_client, &checksum_asset.browser_download_url).await?;
+    let expected_checksum = String::from_utf8(checksum_data)
+        .context("Checksum file is not valid UTF-8")?;
+    
+    // Download new binary
+    let binary_data = download_file(http_client, &binary_asset.browser_download_url).await?;
+    
+    // Verify checksum
+    verify_checksum(&binary_data, &expected_checksum)?;
+    
+    // Get current executable path
+    let current_exe = env::current_exe()
+        .context("Failed to get current executable path")?;
+    
+    let current_exe_str = current_exe.to_string_lossy();
+    let new_exe_path = format!("{}.new", current_exe_str);
+    let backup_exe_path = format!("{}.backup", current_exe_str);
+    
+    println!("Installing new binary to {}", current_exe_str);
+    
+    // Write new binary to .new file
+    let mut new_file = fs::File::create(&new_exe_path)
+        .context("Failed to create .new file")?;
+    new_file.write_all(&binary_data)
+        .context("Failed to write new binary")?;
+    drop(new_file);
+    
+    // Make it executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&new_exe_path)
+            .context("Failed to get .new file metadata")?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&new_exe_path, perms)
+            .context("Failed to set executable permissions")?;
+    }
+    
+    // Copy SELinux context from old binary (if on SELinux system)
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let _ = Command::new("chcon")
+            .arg("--reference")
+            .arg(&current_exe)
+            .arg(&new_exe_path)
+            .output(); // Ignore errors if chcon is not available
+    }
+    
+    // Create backup of current binary
+    fs::copy(&current_exe, &backup_exe_path)
+        .context("Failed to create backup")?;
+    
+    println!("Created backup at {}", backup_exe_path);
+    
+    // Atomic replace: rename new binary over current binary
+    fs::rename(&new_exe_path, &current_exe)
+        .context("Failed to replace current binary")?;
+    
+    println!("Successfully installed new version {}!", release.tag_name);
+    println!("Exiting to allow restart...");
+    
+    // Exit with special code to signal update
+    std::process::exit(42);
+}
+
+/// Check for updates and perform self-update if available
+async fn auto_update_check(http_client: &reqwest::Client) -> Result<()> {
+    println!("Running auto-update check...");
+    
+    match check_for_updates(http_client).await {
+        Ok(Some(release)) => {
+            println!("Update available, starting download...");
+            if let Err(e) = perform_self_update(http_client, release).await {
+                eprintln!("Failed to perform self-update: {}", e);
+                eprintln!("Continuing with current version...");
+            }
+        }
+        Ok(None) => {
+            println!("No update needed");
+        }
+        Err(e) => {
+            eprintln!("Failed to check for updates: {}", e);
+            eprintln!("Continuing with current version...");
+        }
+    }
+    
     Ok(())
 }
 
