@@ -186,17 +186,17 @@ fn get_update_time(now: &DateTime<Utc>) -> DateTime<Utc> {
 }
 
 fn get_current_daily_date(now: &DateTime<Utc>) -> DateTime<Utc> {
-    // Dailies change at 16:00 UTC, but we wait until 16:00:05 to be safe
-    // If current time is before 16:00:05, use yesterday's date
+    // Dailies change at 16:00 UTC
+    // If current time is before 16:00, use yesterday's date
     let daily_cutoff = Utc
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), 16, 0, 5)
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 16, 0, 0)
         .unwrap();
 
     if *now < daily_cutoff {
-        // Before 16:00:05 UTC - use previous day
+        // Before 16:00:00 UTC - use previous day
         *now - Duration::days(1)
     } else {
-        // After 16:00:05 UTC - use current day
+        // At or after 16:00:00 UTC - use current day
         *now
     }
 }
