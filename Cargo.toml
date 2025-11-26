@@ -3,9 +3,9 @@ name = "sheepnet"
 version = "0.1.7"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Nadyita <nadyita@hodorraid.org>"]
 description = "Discord bot that posts daily Guild Wars activities"
-repository = "https://github.com/mreidel/sheepnet"
+repository = "https://github.com/nadyita/sheepnet"
 
 [dependencies]
 # Discord library
